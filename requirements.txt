@@ -1,0 +1,10 @@
+# ── Core Frameworks ──────────────────────────────────────
+torch>=2.0.0
+pennylane>=0.36.0
+
+# ── Reinforcement Learning Environment ──────────────────
+gymnasium>=0.29.0
+
+# ── Numerical & Logging ─────────────────────────────────
+numpy>=1.24.0
+tensorboard>=2.14.0
