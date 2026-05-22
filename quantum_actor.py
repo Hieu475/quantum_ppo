@@ -75,7 +75,7 @@ class QuantumActor(nn.Module):
             self._circuit,
             self.qdev,
             interface="torch",
-            diff_method="parameter-shift",
+            diff_method="backprop",
         )
 
     def _circuit(
