@@ -2,12 +2,15 @@
 main.py — Entry Point for Hybrid Quantum PPO
 ==============================================
 CLI entry point that supports overriding key hyperparameters via
-command-line arguments. Launches the full training pipeline.
+command-line arguments. Automatically detects state_dim and action_dim
+from the specified environment.
 
 Usage:
-    python main.py                           # Default config
-    python main.py --total_timesteps 50000   # Quick test run
-    python main.py --n_layers 3 --actor_lr 1e-3 --seed 123
+    python main.py                                              # Default (CartPole)
+    python main.py --env_name LunarLander-v3 --n_qubits 4      # Different env
+    python main.py --encoding_type angle --n_qubits 4           # Angle encoding
+    python main.py --encoding_type amplitude --n_qubits 3       # Amplitude encoding
+    python main.py --encoding_type data_reuploading --n_layers 3  # Data re-uploading
 
 For TensorBoard monitoring:
     tensorboard --logdir runs
@@ -16,6 +19,8 @@ For TensorBoard monitoring:
 import argparse
 import sys
 
+import gymnasium as gym
+
 from config import Config
 from train import train
 
@@ -23,11 +28,21 @@ from train import train
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for hyperparameter overrides."""
     parser = argparse.ArgumentParser(
-        description="Hybrid Quantum-Classical PPO for CartPole-v1",
+        description="Hybrid Quantum-Classical PPO — Generalized State Encoding",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # ── Environment ─────────────────────────────────────────────────────
+    parser.add_argument(
+        "--env_name", type=str, default="CartPole-v1",
+        help="Gymnasium environment ID.",
+    )
+
     # ── Quantum Actor ───────────────────────────────────────────────────
+    parser.add_argument(
+        "--n_qubits", type=int, default=4,
+        help="Number of qubits in the quantum circuit.",
+    )
     parser.add_argument(
         "--n_layers", type=int, default=2,
         help="Number of variational ansatz layers in the quantum actor.",
@@ -35,6 +50,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--actor_lr", type=float, default=5e-3,
         help="Learning rate for the quantum actor (parameter-shift).",
+    )
+
+    # ── State Encoding ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--encoding_type", type=str, default="data_reuploading",
+        choices=["angle", "amplitude", "data_reuploading"],
+        help="Quantum data encoding strategy.",
+    )
+    parser.add_argument(
+        "--pre_encoding_hidden", type=int, default=64,
+        help="Hidden dimension of the classical pre-encoding network.",
+    )
+    parser.add_argument(
+        "--rotation_gate", type=str, default="ry",
+        choices=["rx", "ry", "rz"],
+        help="Rotation gate for angle encoding (RX, RY, or RZ).",
     )
 
     # ── Classical Critic ────────────────────────────────────────────────
@@ -113,10 +144,61 @@ def main() -> None:
     """Build configuration from CLI args and launch training."""
     args = parse_args()
 
+    # ── Auto-detect environment dimensions ──────────────────────────────
+    temp_env = gym.make(args.env_name)
+    obs_space = temp_env.observation_space
+
+    # Detect state_dim
+    if isinstance(obs_space, gym.spaces.Box):
+        if len(obs_space.shape) == 1:
+            state_dim = obs_space.shape[0]
+        else:
+            # Image: use total pixel count (for config validation only)
+            import math
+            state_dim = math.prod(obs_space.shape)
+    else:
+        raise ValueError(f"Unsupported observation space: {type(obs_space).__name__}")
+
+    # Detect action space type and dimensions
+    action_space = temp_env.action_space
+    if isinstance(action_space, gym.spaces.Discrete):
+        action_type = "discrete"
+        action_dim = action_space.n
+        action_high = None
+        action_low = None
+    elif isinstance(action_space, gym.spaces.Box):
+        action_type = "continuous"
+        action_dim = action_space.shape[0]
+        action_high = action_space.high.tolist()
+        action_low = action_space.low.tolist()
+    else:
+        raise ValueError(
+            f"Unsupported action space: {type(action_space).__name__}. "
+            f"Only Discrete and Box action spaces are supported."
+        )
+
+    temp_env.close()
+
+    print(f"\n🔍 Auto-detected environment: {args.env_name}")
+    print(f"   Observation space: {obs_space}")
+    print(f"   Action space:      {action_type.capitalize()}({action_dim})")
+    print(f"   Encoding type:     {args.encoding_type}")
+    print(f"   Qubits:            {args.n_qubits}")
+
     # ── Build Config ────────────────────────────────────────────────────
     config = Config(
+        env_name=args.env_name,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_type=action_type,
+        action_high=action_high,
+        action_low=action_low,
+        n_qubits=args.n_qubits,
         n_layers=args.n_layers,
         actor_lr=args.actor_lr,
+        encoding_type=args.encoding_type,
+        pre_encoding_hidden=args.pre_encoding_hidden,
+        rotation_gate=args.rotation_gate,
         critic_lr=args.critic_lr,
         critic_hidden=args.critic_hidden,
         gamma=args.gamma,

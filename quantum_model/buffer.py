@@ -13,7 +13,7 @@ Formula:
     Â_t = Σ_{l=0}^{T-t} (γλ)^l δ_{t+l}
 """
 
-from typing import Generator, NamedTuple
+from typing import Generator, NamedTuple, Union
 
 import numpy as np
 import torch
@@ -59,7 +59,7 @@ class RolloutBuffer:
     def store(
         self,
         state: np.ndarray,
-        action: int,
+        action: Union[int, np.ndarray],
         log_prob: float,
         reward: float,
         done: bool,
@@ -141,9 +141,16 @@ class RolloutBuffer:
         self._states = torch.tensor(
             np.array(self.states), dtype=torch.float32
         )
-        self._actions = torch.tensor(
-            np.array(self.actions), dtype=torch.long
-        )
+        
+        if getattr(self.config, "action_type", "discrete") == "discrete":
+            self._actions = torch.tensor(
+                np.array(self.actions), dtype=torch.long
+            )
+        else:
+            self._actions = torch.tensor(
+                np.array(self.actions), dtype=torch.float32
+            )
+            
         self._old_log_probs = torch.tensor(
             np.array(self.log_probs), dtype=torch.float32
         )

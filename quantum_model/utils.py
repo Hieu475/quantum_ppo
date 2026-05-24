@@ -137,7 +137,7 @@ def diagnose_barren_plateau(model: nn.Module, threshold: float = 1e-6) -> dict:
     }
 
 
-def diagnose_entropy(entropy: float, action_dim: int = 2) -> str:
+def diagnose_entropy(entropy: float, action_dim: int = 2, action_type: str = "discrete") -> str:
     """
     Diagnose policy entropy health.
 
@@ -153,6 +153,9 @@ def diagnose_entropy(entropy: float, action_dim: int = 2) -> str:
     Returns:
         Diagnostic message string.
     """
+    if action_type == "continuous":
+        return f"ℹ️  Continuous entropy ({entropy:.4f}). Monitoring std via TensorBoard."
+        
     max_entropy = np.log(action_dim)
     ratio = entropy / max_entropy if max_entropy > 0 else 0.0
 

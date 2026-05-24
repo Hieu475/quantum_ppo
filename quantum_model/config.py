@@ -5,6 +5,11 @@ All tunable parameters are stored in a single dataclass for reproducibility
 and easy hyperparameter sweeps. Separating actor/critic learning rates is
 critical because quantum circuits typically require larger step sizes due
 to the bounded nature of parameter-shift gradients.
+
+Supports generalized state encoding with three quantum encoding strategies:
+  - "angle": Angle Embedding (1 feature per qubit)
+  - "amplitude": Amplitude Embedding (2^q features encoded in q qubits)
+  - "data_reuploading": Data Re-uploading (features re-encoded at each layer)
 """
 
 from dataclasses import dataclass, field
@@ -18,13 +23,21 @@ class Config:
 
     # ── Environment ──────────────────────────────────────────────────────
     env_name: str = "CartPole-v1"
-    state_dim: int = 4          # CartPole observation space
-    action_dim: int = 2         # CartPole action space (left / right)
+    state_dim: int = 4          # Observation dimension (auto-detected in main)
+    action_dim: int = 2         # Action space size (auto-detected in main)
+    action_type: str = "discrete" # "discrete" | "continuous" (auto-detected)
+    action_high: Optional[list] = None # Upper bound for continuous actions
+    action_low: Optional[list] = None  # Lower bound for continuous actions
 
     # ── Quantum Actor ────────────────────────────────────────────────────
-    n_qubits: int = 4           # Must match state_dim for angle encoding
+    n_qubits: int = 4           # Number of qubits in the quantum circuit
     n_layers: int = 2           # Number of variational ansatz layers
     actor_lr: float = 5e-3      # Higher LR for quantum params (parameter-shift)
+
+    # ── State Encoding ───────────────────────────────────────────────────
+    encoding_type: str = "data_reuploading"  # "angle" | "amplitude" | "data_reuploading"
+    pre_encoding_hidden: int = 64            # Hidden dim of Pre-encoding MLP/CNN head
+    rotation_gate: str = "ry"                # Rotation gate for angle encoding: "rx" | "ry" | "rz"
 
     # ── Classical Critic ─────────────────────────────────────────────────
     critic_hidden: int = 64     # Hidden layer width
@@ -70,10 +83,37 @@ class Config:
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
-        assert self.n_qubits == self.state_dim, (
-            f"n_qubits ({self.n_qubits}) must equal state_dim ({self.state_dim}) "
-            f"for angle encoding."
+        # ── Encoding type validation ─────────────────────────────────────
+        valid_encodings = ("angle", "amplitude", "data_reuploading")
+        assert self.encoding_type in valid_encodings, (
+            f"encoding_type must be one of {valid_encodings}, "
+            f"got '{self.encoding_type}'."
         )
+
+        # ── Action type validation ───────────────────────────────────────
+        valid_actions = ("discrete", "continuous")
+        assert self.action_type in valid_actions, (
+            f"action_type must be one of {valid_actions}, "
+            f"got '{self.action_type}'."
+        )
+
+        # ── Rotation gate validation ─────────────────────────────────────
+        valid_gates = ("rx", "ry", "rz")
+        assert self.rotation_gate in valid_gates, (
+            f"rotation_gate must be one of {valid_gates}, "
+            f"got '{self.rotation_gate}'."
+        )
+
+        # ── Amplitude encoding dimension check ──────────────────────────
+        if self.encoding_type == "amplitude":
+            max_features = 2 ** self.n_qubits
+            assert self.state_dim <= max_features, (
+                f"Amplitude encoding with {self.n_qubits} qubits can encode "
+                f"at most {max_features} features, but state_dim={self.state_dim}. "
+                f"Increase n_qubits or use a different encoding."
+            )
+
+        # ── General validations ──────────────────────────────────────────
         assert self.rollout_steps >= self.mini_batch_size, (
             f"rollout_steps ({self.rollout_steps}) must be >= "
             f"mini_batch_size ({self.mini_batch_size})."
@@ -81,3 +121,5 @@ class Config:
         assert 0 < self.clip_epsilon < 1, "clip_epsilon must be in (0, 1)."
         assert 0 < self.gamma <= 1, "gamma must be in (0, 1]."
         assert 0 < self.gae_lambda <= 1, "gae_lambda must be in (0, 1]."
+        assert self.n_qubits >= 1, "n_qubits must be at least 1."
+        assert self.n_layers >= 1, "n_layers must be at least 1."

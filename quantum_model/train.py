@@ -18,6 +18,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
 from config import Config
@@ -50,7 +51,8 @@ def train(config: Config) -> None:
     # ── Setup ───────────────────────────────────────────────────────────
     set_seed(config.seed)
     env = make_env(config.env_name, config.seed)
-    agent = HybridAgent(config)
+    obs_space = env.observation_space
+    agent = HybridAgent(config, obs_space)
     buffer = RolloutBuffer(config)
     ppo = PPO(agent, config)
 
@@ -82,8 +84,13 @@ def train(config: Config) -> None:
     print(" Hybrid Quantum PPO Training")
     print("=" * 60)
     print(f"  Environment:     {config.env_name}")
+    print(f"  Obs Space:       {obs_space}")
+    print(f"  Encoding:        {config.encoding_type}")
+    print(f"  Rotation Gate:   {config.rotation_gate}")
+    print(f"  Action Type:     {getattr(config, 'action_type', 'discrete')}")
     print(f"  Qubits:          {config.n_qubits}")
     print(f"  VQC Layers:      {config.n_layers}")
+    print(f"  Pre-enc Hidden:  {config.pre_encoding_hidden}")
     print(f"  Actor LR:        {config.actor_lr}")
     print(f"  Critic LR:       {config.critic_lr}")
     print(f"  Rollout Steps:   {config.rollout_steps}")
@@ -97,9 +104,15 @@ def train(config: Config) -> None:
     # Count parameters
     actor_params = sum(p.numel() for p in agent.actor.parameters())
     critic_params = sum(p.numel() for p in agent.critic.parameters())
-    quantum_params = agent.actor.q_params.numel() + agent.actor.input_scaling.numel()
-    print(f" Actor params:  {actor_params} (quantum: {quantum_params}, "
-          f"classical: {actor_params - quantum_params})")
+    quantum_params = agent.actor.q_params.numel()
+    if isinstance(agent.actor.input_scaling, nn.Parameter):
+        quantum_params += agent.actor.input_scaling.numel()
+    pre_enc_params = sum(p.numel() for p in agent.actor.pre_encoding_nn.parameters())
+    post_params = sum(p.numel() for p in agent.actor.post_nn.parameters())
+    print(f" Actor params:  {actor_params}")
+    print(f"   ├─ Quantum circuit: {quantum_params}")
+    print(f"   ├─ Pre-encoding:   {pre_enc_params}")
+    print(f"   └─ Post-processing: {post_params}")
     print(f" Critic params: {critic_params}")
     print()
 
@@ -216,19 +229,27 @@ def train(config: Config) -> None:
             "timing/update_sec", update_time, global_step
         )
 
-        # ── Policy variance (softmax output distribution) ──────────────
-        # High variance → diverse actions; low variance → deterministic
+        # ── Policy variance/std ────────────────────────────────────────
+        # High variance/std → diverse actions; low variance/std → deterministic
         with torch.no_grad():
             sample_state = torch.tensor(
                 env.observation_space.sample(), dtype=torch.float32
             )
             dist = agent.actor.get_distribution(sample_state)
-            policy_probs = dist.probs
-            writer.add_scalar(
-                "training/policy_variance",
-                policy_probs.var().item(),
-                global_step,
-            )
+            if getattr(config, "action_type", "discrete") == "discrete":
+                policy_probs = dist.probs
+                writer.add_scalar(
+                    "training/policy_variance",
+                    policy_probs.var().item(),
+                    global_step,
+                )
+            else:
+                std = torch.exp(agent.actor.log_std).mean().item()
+                writer.add_scalar(
+                    "training/policy_std",
+                    std,
+                    global_step,
+                )
 
         # ── Phase 5: Diagnostics ────────────────────────────────────────
         if (
@@ -256,7 +277,7 @@ def train(config: Config) -> None:
 
             # Entropy health check
             entropy_msg = diagnose_entropy(
-                metrics["entropy"], config.action_dim
+                metrics["entropy"], config.action_dim, getattr(config, "action_type", "discrete")
             )
             print(f"   Entropy Diagnostic: {entropy_msg}")
 

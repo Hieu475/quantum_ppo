@@ -6,15 +6,20 @@ for rollout collection and PPO evaluation. Handles device transfers,
 numerical stability (log-prob clamping), and provides clean APIs for
 the training loop.
 
+Now accepts obs_space to support generalized state encoding, allowing
+the actor and critic to auto-adapt to any Gymnasium observation space.
+
 The agent does NOT own the optimizers — those live in the PPO module
 to maintain separation of concerns.
 """
 
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
 import numpy as np
+
+import gymnasium as gym
 
 from config import Config
 from quantum_actor import QuantumActor
@@ -26,23 +31,24 @@ class HybridAgent(nn.Module):
     Hybrid RL agent combining a quantum actor and classical critic.
 
     The actor produces a policy π(a|s) via a variational quantum circuit,
-    while the critic estimates V(s) via a classical MLP. Both are wrapped
-    in a single nn.Module for convenient parameter access.
+    while the critic estimates V(s) via a classical MLP (or CNN+MLP for
+    image observations). Both are wrapped in a single nn.Module for
+    convenient parameter access.
 
     Attributes:
-        actor: Quantum actor (VQC-based policy).
-        critic: Classical critic (MLP-based value function).
+        actor: Quantum actor (VQC-based policy) with pre-encoding NN.
+        critic: Classical critic (MLP/CNN-based value function).
         device: Computation device (CPU/GPU).
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, obs_space: gym.spaces.Space) -> None:
         super().__init__()
         self.config = config
         self.device = config.device
 
         # ── Sub-modules ─────────────────────────────────────────────────
-        self.actor = QuantumActor(config)
-        self.critic = Critic(config)
+        self.actor = QuantumActor(config, obs_space)
+        self.critic = Critic(config, obs_space)
 
         # Move critic to device (actor runs on CPU via PennyLane simulator)
         self.critic.to(self.device)
@@ -55,7 +61,7 @@ class HybridAgent(nn.Module):
     @torch.no_grad()
     def select_action(
         self, state: np.ndarray
-    ) -> Tuple[int, float, float]:
+    ) -> Tuple[Union[int, np.ndarray], float, float]:
         """
         Select an action during rollout collection (no gradient needed).
 
@@ -64,7 +70,7 @@ class HybridAgent(nn.Module):
 
         Returns:
             Tuple of (action, log_probability, value_estimate).
-            - action: Integer action for the environment.
+            - action: Integer action or Numpy array for the environment.
             - log_probability: log π(a|s), used as old_log_prob in PPO.
             - value_estimate: V(s) from the critic.
         """
@@ -79,8 +85,13 @@ class HybridAgent(nn.Module):
         state_device = state_tensor.to(self.device)
         value = self.critic(state_device).squeeze(-1)
 
+        if getattr(self.config, "action_type", "discrete") == "discrete":
+            action_out = action.item()
+        else:
+            action_out = action.cpu().numpy()
+
         return (
-            action.item(),
+            action_out,
             log_prob.item(),
             value.cpu().item(),
         )

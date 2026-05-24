@@ -1,58 +1,79 @@
 """
-quantum_actor.py — Variational Quantum Circuit Actor with Data Re-uploading
-============================================================================
+quantum_actor.py — Generalized Variational Quantum Circuit Actor
+=================================================================
 Implements the policy network as a parameterized quantum circuit (PQC)
-using PennyLane with PyTorch integration. Uses the Data Re-uploading
-technique (Pérez-Salinas et al., 2020) to interleave data encoding with
-variational layers, enabling the circuit to express higher-order Fourier
-series and act as a universal function approximator.
+using PennyLane with PyTorch integration. Supports three quantum data
+encoding strategies:
+
+  1. Angle Embedding: RY(x_i) per qubit → Variational layers (depth=1 encoding)
+  2. Amplitude Embedding: Encode 2^q features into q qubits via amplitudes
+  3. Data Re-uploading: Interleave encoding with variational layers at each depth
+
+The classical Pre-encoding NN (state_encoder.py) automatically compresses
+any observation space (vector or image) into the required feature dimension,
+then normalizes to [-π, π] for quantum gate compatibility.
 
 Architecture:
-    [RY(w_scale · s) Encoding → RX, RY, RZ rotations → CNOT chain] × L layers
-    → PauliZ measurements → Linear(4→2) → Softmax → π(a|s)
+    Observation → PreEncodingNN(obs → target_dim, Tanh×π) → Quantum Circuit → 
+    PauliZ measurements → Linear(q → action_dim) → Softmax → π(a|s)
 
 Key design choices:
+  - PreEncodingNN decouples n_qubits from state_dim, enabling any environment
   - Data re-uploading provides non-linearity analogous to activation functions
-    in classical neural networks, allowing the Quantum Actor to learn complex,
-    smooth policies.
-  - Trainable input scaling factors adjust the "frequency" of input features
-    per layer, accelerating convergence.
+  - Trainable input scaling adjusts "frequency" of features per layer
+  - Rotation gate choice (RX/RY/RZ) is configurable for angle encoding
 """
 
 from typing import Tuple
 
+import math
 import numpy as np
 import pennylane as qml
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal, Independent
+
+import gymnasium as gym
 
 from config import Config
+from state_encoder import PreEncodingNN
 
 
 class QuantumActor(nn.Module):
     """
-    Variational Quantum Circuit (VQC) policy network with Data Re-uploading.
+    Generalized Variational Quantum Circuit (VQC) policy network.
 
-    The quantum circuit acts as a feature extractor, producing 4 expectation
-    values that are linearly mapped to 2 action logits. Data Re-uploading
-    re-encodes the input state at every variational layer, enabling the
-    circuit to represent higher-order Fourier series (non-linear functions).
+    Supports angle, amplitude, and data re-uploading encoding strategies.
+    Automatically adapts to any Gymnasium observation space via the
+    PreEncodingNN classical compression layer.
 
     Attributes:
-        n_qubits: Number of qubits (= state dimension).
+        n_qubits: Number of qubits in the quantum circuit.
         n_layers: Number of variational ansatz layers.
-        q_params: Trainable quantum rotation angles, shape (n_layers, n_qubits, 3).
-        input_scaling: Trainable scaling factors for re-uploaded inputs,
-                       shape (n_layers, n_qubits).
+        encoding_type: Quantum encoding strategy ("angle"|"amplitude"|"data_reuploading").
+        pre_encoding_nn: Classical compression network.
+        q_params: Trainable quantum rotation angles.
+        input_scaling: Trainable input scaling (data_reuploading only).
         output_map: Linear layer mapping measurements to action logits.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, obs_space: gym.spaces.Space) -> None:
         super().__init__()
         self.n_qubits = config.n_qubits
         self.n_layers = config.n_layers
         self.action_dim = config.action_dim
+        self.action_type = getattr(config, "action_type", "discrete")
+        self.encoding_type = config.encoding_type
+        self.rotation_gate = config.rotation_gate
+
+        # ── Classical Pre-encoding NN ────────────────────────────────────
+        # Compresses any observation into target_dim features in [-π, π]
+        self.pre_encoding_nn = PreEncodingNN(
+            obs_space=obs_space,
+            n_qubits=config.n_qubits,
+            encoding_type=config.encoding_type,
+            hidden_dim=config.pre_encoding_hidden,
+        )
 
         # ── PennyLane quantum device (simulator) ────────────────────────
         self.qdev = qml.device("default.qubit", wires=self.n_qubits)
@@ -68,54 +89,181 @@ class QuantumActor(nn.Module):
         )
         self.q_params = nn.Parameter(torch.tensor(init_params, dtype=torch.float32))
 
-        # ── Trainable input scaling factors (Data Re-uploading) ─────────
+        # ── Trainable input scaling factors (Data Re-uploading only) ────
         # Shape: (n_layers, n_qubits) — one scale per qubit per layer.
-        # Initialized to 1.0 so the first forward pass behaves like
-        # standard angle encoding; the optimizer then tunes frequencies.
-        self.input_scaling = nn.Parameter(
-            torch.ones(self.n_layers, self.n_qubits, dtype=torch.float32)
-        )
+        # Initialized to 1.0 so first forward pass behaves like standard
+        # angle encoding; the optimizer then tunes frequencies.
+        if self.encoding_type == "data_reuploading":
+            self.input_scaling = nn.Parameter(
+                torch.ones(self.n_layers, self.n_qubits, dtype=torch.float32)
+            )
+        else:
+            # Register as buffer (not trainable) for angle/amplitude
+            self.register_buffer(
+                "input_scaling",
+                torch.ones(self.n_layers, self.n_qubits, dtype=torch.float32),
+            )
 
         # ── Classical post-processing ───────────────────────────────────
-        # Maps 4 PauliZ expectations ∈ [-1, 1] → 2 action logits
-        self.output_map = nn.Linear(self.n_qubits, self.action_dim)
+        # Maps n_qubits PauliZ expectations ∈ [-1, 1] → action_dim logits/means
+        self.post_nn = nn.Linear(self.n_qubits, self.action_dim)
 
-        # Initialize output mapping with small weights for stable initial policy
-        nn.init.xavier_uniform_(self.output_map.weight, gain=0.1)
-        nn.init.zeros_(self.output_map.bias)
+        # Initialize post-processing mapping with small weights for stable initial policy
+        nn.init.xavier_uniform_(self.post_nn.weight, gain=0.1)
+        nn.init.zeros_(self.post_nn.bias)
+
+        # ── Continuous Action Space Parameters ──────────────────────────
+        if self.action_type == "continuous":
+            # Trainable log standard deviation for continuous actions
+            self.log_std = nn.Parameter(torch.zeros(self.action_dim))
+            
+            # Buffers for action bounds scaling
+            action_high = getattr(config, "action_high", None)
+            action_low = getattr(config, "action_low", None)
+            
+            if action_high is not None and action_low is not None:
+                self.register_buffer("action_high", torch.tensor(action_high, dtype=torch.float32))
+                self.register_buffer("action_low", torch.tensor(action_low, dtype=torch.float32))
+            else:
+                self.register_buffer("action_high", torch.ones(self.action_dim, dtype=torch.float32))
+                self.register_buffer("action_low", -torch.ones(self.action_dim, dtype=torch.float32))
 
         # ── Build QNode with PyTorch interface ──────────────────────────
-        # diff_method="parameter-shift" ensures hardware-compatible gradients
-        # interface="torch" ensures outputs are torch tensors with autograd support
+        # Select the appropriate circuit based on encoding_type
+        circuit_fn = self._get_circuit_fn()
         self.qnode = qml.QNode(
-            self._circuit,
+            circuit_fn,
             self.qdev,
             interface="torch",
             diff_method="backprop",
         )
 
-    def _circuit(
+    def _get_circuit_fn(self):
+        """Return the appropriate quantum circuit function for the encoding type."""
+        if self.encoding_type == "angle":
+            return self._circuit_angle
+        elif self.encoding_type == "amplitude":
+            return self._circuit_amplitude
+        elif self.encoding_type == "data_reuploading":
+            return self._circuit_data_reuploading
+        else:
+            raise ValueError(f"Unknown encoding_type: {self.encoding_type}")
+
+    # ════════════════════════════════════════════════════════════════════
+    # QUANTUM CIRCUITS — Three Encoding Strategies
+    # ════════════════════════════════════════════════════════════════════
+
+    def _apply_rotation_gate(self, angle: torch.Tensor, wire: int) -> None:
+        """Apply the configured rotation gate (RX, RY, or RZ) to a wire."""
+        if self.rotation_gate == "rx":
+            qml.RX(angle, wires=wire)
+        elif self.rotation_gate == "ry":
+            qml.RY(angle, wires=wire)
+        elif self.rotation_gate == "rz":
+            qml.RZ(angle, wires=wire)
+
+    def _variational_layer(self, weights_layer: torch.Tensor) -> None:
+        """
+        Apply one variational layer: single-qubit rotations + CNOT entanglement.
+
+        Args:
+            weights_layer: Rotation angles, shape (n_qubits, 3).
+        """
+        # Trainable single-qubit rotations: RX, RY, RZ
+        for qubit in range(self.n_qubits):
+            qml.RX(weights_layer[qubit, 0], wires=qubit)
+            qml.RY(weights_layer[qubit, 1], wires=qubit)
+            qml.RZ(weights_layer[qubit, 2], wires=qubit)
+
+        # Entanglement via CNOT chain: (0,1), (1,2), ..., (q-2, q-1)
+        for qubit in range(self.n_qubits - 1):
+            qml.CNOT(wires=[qubit, qubit + 1])
+
+    def _circuit_angle(
         self, inputs: torch.Tensor, weights: torch.Tensor,
         scaling: torch.Tensor,
     ) -> list:
         """
-        Define the quantum circuit with Data Re-uploading.
+        Angle Embedding circuit.
 
-        At each variational layer the input state is re-encoded via
-        RY(scaling[layer] · inputs) *before* the trainable rotations.
-        This interleaving produces a unitary of the form:
-            U = ∏_{l=1}^{L} W_l(θ_l) · S(w_l · s)
-        enabling the circuit to express higher-order Fourier series.
+        Encodes each classical feature x_i as a rotation angle on qubit i,
+        then applies variational layers for learning.
+
+        |ψ⟩ = ∏_l W_l(θ_l) · ⊗_i R(x_i) |0⟩^⊗q
 
         Args:
-            inputs: State features, shape (n_qubits,).
-            weights: Variational parameters, shape (n_layers, n_qubits, 3).
-            scaling: Input scaling factors, shape (n_layers, n_qubits).
+            inputs: Encoded features, shape (n_qubits,).
+            weights: Variational params, shape (n_layers, n_qubits, 3).
+            scaling: Input scaling (unused for angle, kept for interface).
 
         Returns:
-            List of PauliZ expectation values, one per qubit.
+            List of PauliZ expectation values.
         """
-        # ── Data Re-uploading + Variational Ansatz ──────────────────────
+        # Single encoding layer at the beginning
+        for qubit in range(self.n_qubits):
+            self._apply_rotation_gate(inputs[qubit], wire=qubit)
+
+        # Variational layers
+        for layer in range(weights.shape[0]):
+            self._variational_layer(weights[layer])
+
+        return [qml.expval(qml.PauliZ(i)) for i in range(self.n_qubits)]
+
+    def _circuit_amplitude(
+        self, inputs: torch.Tensor, weights: torch.Tensor,
+        scaling: torch.Tensor,
+    ) -> list:
+        """
+        Amplitude Embedding circuit.
+
+        Encodes 2^q classical features into the probability amplitudes
+        of q qubits, then applies variational layers.
+
+        |ψ_x⟩ = Σ_i x_i |i⟩  (with normalization ||x||=1)
+
+        Args:
+            inputs: Feature vector, shape (2^n_qubits,).
+            weights: Variational params, shape (n_layers, n_qubits, 3).
+            scaling: Input scaling (unused, kept for interface).
+
+        Returns:
+            List of PauliZ expectation values.
+        """
+        # Amplitude embedding with automatic L2 normalization
+        qml.AmplitudeEmbedding(
+            features=inputs,
+            wires=range(self.n_qubits),
+            normalize=True,
+        )
+
+        # Variational layers
+        for layer in range(weights.shape[0]):
+            self._variational_layer(weights[layer])
+
+        return [qml.expval(qml.PauliZ(i)) for i in range(self.n_qubits)]
+
+    def _circuit_data_reuploading(
+        self, inputs: torch.Tensor, weights: torch.Tensor,
+        scaling: torch.Tensor,
+    ) -> list:
+        """
+        Data Re-uploading circuit.
+
+        Re-encodes the input features at every variational layer,
+        interleaving encoding with trainable rotations. This enables
+        the circuit to approximate arbitrary functions (Universal
+        Function Approximator).
+
+        U(θ,x) = ∏_l W_l(θ_l) · S(w_l · x) |0⟩^⊗q
+
+        Args:
+            inputs: Encoded features, shape (n_qubits,).
+            weights: Variational params, shape (n_layers, n_qubits, 3).
+            scaling: Trainable input scaling, shape (n_layers, n_qubits).
+
+        Returns:
+            List of PauliZ expectation values.
+        """
         for layer in range(weights.shape[0]):
             # Re-upload: encode scaled input features at every layer
             for qubit in range(self.n_qubits):
@@ -127,46 +275,67 @@ class QuantumActor(nn.Module):
                 qml.RY(weights[layer, qubit, 1], wires=qubit)
                 qml.RZ(weights[layer, qubit, 2], wires=qubit)
 
-            # Entanglement via CNOT chain: (0,1), (1,2), (2,3)
-            # Creates nearest-neighbor correlations between qubits
+            # Entanglement via CNOT chain
             for qubit in range(self.n_qubits - 1):
                 qml.CNOT(wires=[qubit, qubit + 1])
 
-        # ── Measurement ─────────────────────────────────────────────────
-        # Expectation values of PauliZ on each qubit ∈ [-1, 1]
         return [qml.expval(qml.PauliZ(i)) for i in range(self.n_qubits)]
+
+    # ════════════════════════════════════════════════════════════════════
+    # FORWARD PASS & DISTRIBUTION METHODS
+    # ════════════════════════════════════════════════════════════════════
 
     def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass: state → action logits.
+        Forward pass: raw observation → action logits.
 
-        Handles both single states and batched states.
+        Pipeline: state → PreEncodingNN(compress + Tanh×π) → Quantum Circuit → output_map
 
         Args:
             state: Input state tensor, shape (state_dim,) or (batch, state_dim).
+                   For images: (H, W, C) or (batch, H, W, C).
 
         Returns:
-            Action logits, shape (action_dim,) or (batch, action_dim).
+            Discrete: Action logits, shape (action_dim,) or (batch, action_dim).
+            Continuous: Action means (scaled), shape (action_dim,) or (batch, action_dim).
         """
-        if state.dim() == 1:
+        # ── Classical pre-encoding: compress + normalize to [-π, π] ─────
+        encoded = self.pre_encoding_nn(state)
+
+        if encoded.dim() == 1:
             # Single state: run circuit once
-            measurements = self.qnode(state, self.q_params, self.input_scaling)
+            measurements = self.qnode(encoded, self.q_params, self.input_scaling)
             # Stack PennyLane outputs into a single tensor
-            # PennyLane returns float64; cast to float32 for nn.Linear compatibility
             meas_tensor = torch.stack(list(measurements)).float()
-            logits = self.output_map(meas_tensor)
-            return logits
+            
+            if self.action_type == "discrete":
+                return self.post_nn(meas_tensor)
+            else:
+                raw_mean = torch.tanh(self.post_nn(meas_tensor))
+                # Scale from [-1, 1] to [action_low, action_high]
+                scale = (self.action_high - self.action_low) / 2.0
+                offset = (self.action_high + self.action_low) / 2.0
+                return raw_mean * scale + offset
         else:
             # Batched states: run circuit for each sample
-            # Note: PennyLane parameter-shift does not natively vectorize
-            # over batch dimensions, so we loop (acceptable for research).
-            batch_logits = []
-            for i in range(state.shape[0]):
-                measurements = self.qnode(state[i], self.q_params, self.input_scaling)
+            # Note: PennyLane does not natively vectorize over batch dims
+            batch_outputs = []
+            for i in range(encoded.shape[0]):
+                measurements = self.qnode(
+                    encoded[i], self.q_params, self.input_scaling
+                )
                 meas_tensor = torch.stack(list(measurements)).float()
-                logits = self.output_map(meas_tensor)
-                batch_logits.append(logits)
-            return torch.stack(batch_logits)
+                batch_outputs.append(meas_tensor)
+                
+            batch_tensor = torch.stack(batch_outputs)
+            
+            if self.action_type == "discrete":
+                return self.post_nn(batch_tensor)
+            else:
+                raw_mean = torch.tanh(self.post_nn(batch_tensor))
+                scale = (self.action_high - self.action_low) / 2.0
+                offset = (self.action_high + self.action_low) / 2.0
+                return raw_mean * scale + offset
 
     def get_distribution(self, state: torch.Tensor) -> Categorical:
         """
@@ -176,10 +345,17 @@ class QuantumActor(nn.Module):
             state: Input state, shape (state_dim,) or (batch, state_dim).
 
         Returns:
-            Categorical distribution over actions.
+            Categorical or Independent(Normal) distribution over actions.
         """
-        logits = self.forward(state)
-        return Categorical(logits=logits)
+        output = self.forward(state)
+        if self.action_type == "discrete":
+            return Categorical(logits=output)
+        else:
+            # Expand log_std to match batch size if necessary
+            std = torch.exp(self.log_std)
+            if output.dim() > 1:
+                std = std.expand_as(output)
+            return Independent(Normal(output, std), 1)
 
     def get_action_and_log_prob(
         self, state: torch.Tensor
