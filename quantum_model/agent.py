@@ -44,7 +44,9 @@ class HybridAgent(nn.Module):
     def __init__(self, config: Config, obs_space: gym.spaces.Space) -> None:
         super().__init__()
         self.config = config
-        self.device = config.device
+        # Force device to CPU to avoid PCIe bottleneck with PennyLane (which runs on CPU)
+        # Moving tensors back and forth for every step/epoch is much slower than CPU compute
+        self.device = torch.device("cpu")
 
         # ── Sub-modules ─────────────────────────────────────────────────
         self.actor = QuantumActor(config, obs_space)
@@ -116,21 +118,15 @@ class HybridAgent(nn.Module):
             - values: V(s), shape (batch,).
         """
         # ── Actor evaluation ────────────────────────────────────────────
-        # PennyLane quantum circuits run on CPU, so we must ensure
-        # states and actions are on CPU for actor evaluation.
-        states_cpu = states.cpu()
-        actions_cpu = actions.cpu()
-        log_probs, entropy = self.actor.evaluate(states_cpu, actions_cpu)
+        log_probs, entropy = self.actor.evaluate(states, actions)
 
         # Clamp log-probs for numerical stability
         log_probs = torch.clamp(log_probs, self.log_prob_min, self.log_prob_max)
 
         # ── Critic evaluation ───────────────────────────────────────────
-        states_device = states.to(self.device)
-        values = self.critic(states_device).squeeze(-1)
+        values = self.critic(states).squeeze(-1)
 
-        # Ensure all outputs are on the same device (CPU for compatibility)
-        return log_probs, entropy, values.cpu()
+        return log_probs, entropy, values
 
     @torch.no_grad()
     def get_value(self, state: np.ndarray) -> float:
