@@ -194,12 +194,15 @@ def train(config: Config) -> None:
 
         # ── Phase 3: PPO Update ─────────────────────────────────────────
         update_start = time.time()
+        ppo.update_learning_rate(global_step, config.total_timesteps)
         metrics = ppo.update(buffer)
         update_time = time.time() - update_start
         update_count += 1
 
         # ── Phase 4: Logging ────────────────────────────────────────────
         # TensorBoard: training metrics
+        writer.add_scalar("training/actor_lr", ppo.actor_optimizer.param_groups[0]["lr"], global_step)
+        writer.add_scalar("training/critic_lr", ppo.critic_optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("loss/actor", metrics["actor_loss"], global_step)
         writer.add_scalar("loss/critic", metrics["critic_loss"], global_step)
         writer.add_scalar("loss/entropy", metrics["entropy"], global_step)

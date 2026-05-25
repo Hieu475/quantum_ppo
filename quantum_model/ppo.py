@@ -56,6 +56,20 @@ class PPO:
             agent.get_critic_params(), lr=config.critic_lr
         )
 
+    def update_learning_rate(self, global_step: int, total_timesteps: int) -> None:
+        """Linearly decay the learning rate to 0."""
+        frac = 1.0 - (global_step - 1.0) / total_timesteps
+        if frac <= 0:
+            frac = 0.0
+
+        actor_lr = self.config.actor_lr * frac
+        for param_group in self.actor_optimizer.param_groups:
+            param_group["lr"] = actor_lr
+
+        critic_lr = self.config.critic_lr * frac
+        for param_group in self.critic_optimizer.param_groups:
+            param_group["lr"] = critic_lr
+
     def update(self, buffer: RolloutBuffer) -> Dict[str, float]:
         """
         Perform PPO update over multiple epochs of minibatch updates.
