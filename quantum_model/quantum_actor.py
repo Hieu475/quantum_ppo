@@ -82,12 +82,13 @@ class QuantumActor(nn.Module):
         # Shape: (n_layers, n_qubits, 3) for RX, RY, RZ per qubit per layer
         # Initialize with small random values to avoid symmetry and mitigate
         # barren plateaus in shallow circuits.
-        init_params = np.random.uniform(
-            low=-np.pi * 0.1,
-            high=np.pi * 0.1,
+        init_params = torch.normal(
+            mean=0.0,
+            std=0.01,
             size=(self.n_layers, self.n_qubits, 3),
+            dtype=torch.float32,
         )
-        self.q_params = nn.Parameter(torch.tensor(init_params, dtype=torch.float32))
+        self.q_params = nn.Parameter(init_params)
 
         # ── Trainable input scaling factors (Data Re-uploading only) ────
         # Shape: (n_layers, n_qubits) — one scale per qubit per layer.
