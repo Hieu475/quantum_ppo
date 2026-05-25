@@ -76,7 +76,7 @@ class QuantumActor(nn.Module):
         )
 
         # ── PennyLane quantum device (simulator) ────────────────────────
-        self.qdev = qml.device("default.qubit", wires=self.n_qubits)
+        self.qdev = qml.device("lightning.qubit", wires=self.n_qubits)
 
         # ── Trainable quantum parameters ────────────────────────────────
         # Shape: (n_layers, n_qubits, 3) for RX, RY, RZ per qubit per layer
@@ -135,7 +135,7 @@ class QuantumActor(nn.Module):
             circuit_fn,
             self.qdev,
             interface="torch",
-            diff_method="backprop",
+            diff_method="adjoint",
         )
 
     def _get_circuit_fn(self):
@@ -317,17 +317,18 @@ class QuantumActor(nn.Module):
                 offset = (self.action_high + self.action_low) / 2.0
                 return raw_mean * scale + offset
         else:
-            # Batched states: run circuit for each sample
-            # Note: PennyLane does not natively vectorize over batch dims
-            batch_outputs = []
-            for i in range(encoded.shape[0]):
-                measurements = self.qnode(
-                    encoded[i], self.q_params, self.input_scaling
-                )
-                meas_tensor = torch.stack(list(measurements)).float()
-                batch_outputs.append(meas_tensor)
+            # Batched states: use native PennyLane broadcasting instead of vmap
+            # (vmap crashes during backward pass with adjoint diff_method)
+            if self.encoding_type == "amplitude":
+                # AmplitudeEmbedding natively broadcasts (batch, features)
+                inputs = encoded
+            else:
+                # angle and data_reuploading expect inputs[qubit] to be (batch,)
+                # so we transpose (batch, n_qubits) -> (n_qubits, batch)
+                inputs = encoded.T
                 
-            batch_tensor = torch.stack(batch_outputs)
+            measurements = self.qnode(inputs, self.q_params, self.input_scaling)
+            batch_tensor = torch.stack(list(measurements), dim=1).float()
             
             if self.action_type == "discrete":
                 return self.post_nn(batch_tensor)
