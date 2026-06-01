@@ -76,12 +76,20 @@ class QuantumActor(nn.Module):
         )
 
         # ── PennyLane quantum device (simulator) ────────────────────────
-        try:
-            self.qdev = qml.device("lightning.gpu", wires=self.n_qubits)
-            print("Successfully initialized lightning.gpu device.")
-        except qml.DeviceError:
+        # GPU simulation is only beneficial for large qubit counts (>=20).
+        # For small circuits, GPU kernel-launch & CPU<->GPU data-transfer
+        # overhead dominates and can make GPU ~5x SLOWER than CPU.
+        GPU_QUBIT_THRESHOLD = 20
+        if self.n_qubits >= GPU_QUBIT_THRESHOLD:
+            try:
+                self.qdev = qml.device("lightning.gpu", wires=self.n_qubits)
+                print(f"Using lightning.gpu device ({self.n_qubits} qubits >= threshold {GPU_QUBIT_THRESHOLD}).")
+            except qml.DeviceError:
+                self.qdev = qml.device("lightning.qubit", wires=self.n_qubits)
+                print("Warning: lightning.gpu not available. Falling back to lightning.qubit.")
+        else:
             self.qdev = qml.device("lightning.qubit", wires=self.n_qubits)
-            print("Warning: lightning.gpu not available. Falling back to lightning.qubit.")
+            print(f"Using lightning.qubit device ({self.n_qubits} qubits < threshold {GPU_QUBIT_THRESHOLD}; CPU is faster for small circuits).")
         # ── Trainable quantum parameters ────────────────────────────────
         # Shape: (n_layers, n_qubits, 3) for RX, RY, RZ per qubit per layer
         # Initialize with small random values to avoid symmetry and mitigate
