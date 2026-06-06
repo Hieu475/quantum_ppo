@@ -141,8 +141,13 @@ class RolloutBuffer:
         self._states = torch.tensor(
             np.array(self.states), dtype=torch.float32
         )
+        action_dtype = (
+            torch.float32
+            if getattr(self.config, "action_type", "discrete") == "continuous"
+            else torch.long
+        )
         self._actions = torch.tensor(
-            np.array(self.actions), dtype=torch.long
+            np.array(self.actions), dtype=action_dtype
         )
         self._old_log_probs = torch.tensor(
             np.array(self.log_probs), dtype=torch.float32

@@ -10,6 +10,7 @@ enabling a clean apples-to-apples comparison of sample efficiency.
 
 from typing import Tuple
 
+import gymnasium as gym
 import torch
 import torch.nn as nn
 import numpy as np
@@ -33,14 +34,28 @@ class ClassicalAgent(nn.Module):
         device: Computation device (CPU/GPU).
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, obs_space: gym.spaces.Space = None) -> None:
         super().__init__()
         self.config = config
         self.device = config.device
 
         # ── Sub-modules ─────────────────────────────────────────────────
         self.actor = ClassicalActor(config)
-        self.critic = Critic(config)
+
+        # Critic: quantum module's Critic (được import do PYTHONPATH ưu tiên
+        # src/quantum) yêu cầu obs_space để tự động adapt với mọi environment.
+        # Classical Critic cũ chỉ hỗ trợ CartPole (state_dim hardcoded).
+        # obs_space=None xảy ra khi gọi từ code cũ → fallback dùng config.state_dim.
+        if obs_space is not None:
+            self.critic = Critic(config, obs_space)
+        else:
+            # Fallback: tạo obs_space giả từ config.state_dim để tương thích ngược
+            import numpy as np
+            fake_obs_space = gym.spaces.Box(
+                low=-np.inf, high=np.inf,
+                shape=(config.state_dim,), dtype=np.float32
+            )
+            self.critic = Critic(config, fake_obs_space)
 
         # Move everything to device (no PennyLane CPU constraint)
         self.actor.to(self.device)
@@ -76,7 +91,8 @@ class ClassicalAgent(nn.Module):
         value = self.critic(state_tensor).squeeze(-1)
 
         return (
-            action.item(),
+            action.cpu().numpy() if getattr(self.config, "action_type", "discrete") == "continuous"
+            else action.item(),
             log_prob.item(),
             value.cpu().item(),
         )

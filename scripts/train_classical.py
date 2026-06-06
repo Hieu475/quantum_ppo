@@ -166,7 +166,7 @@ def train_classical(config: Config) -> None:
     # ── Setup ───────────────────────────────────────────────────────────
     set_seed(config.seed)
     env = make_env(config.env_name, config.seed)
-    agent = ClassicalAgent(config)
+    agent = ClassicalAgent(config, obs_space=env.observation_space)
     buffer = RolloutBuffer(config)
     ppo = ClassicalPPO(agent, config)
 
@@ -406,8 +406,13 @@ def train_classical(config: Config) -> None:
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Classical PPO Baseline for CartPole-v1",
+        description="Classical PPO Baseline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--env_name", type=str, default="CartPole-v1",
+        help="Gymnasium environment ID.",
     )
 
     parser.add_argument(
@@ -475,15 +480,60 @@ def parse_args() -> argparse.Namespace:
         "--log_dir", type=str, default="runs",
         help="TensorBoard log directory.",
     )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="checkpoints",
+        help="Directory to save model checkpoints.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     """Build configuration from CLI args and launch classical training."""
+    import gymnasium as gym
+
     args = parse_args()
 
+    # ── Auto-detect environment dimensions ──────────────────────────────
+    temp_env = gym.make(args.env_name)
+    obs_space = temp_env.observation_space
+
+    if isinstance(obs_space, gym.spaces.Box):
+        if len(obs_space.shape) == 1:
+            state_dim = obs_space.shape[0]
+        else:
+            import math
+            state_dim = math.prod(obs_space.shape)
+    else:
+        raise ValueError(f"Unsupported observation space: {type(obs_space).__name__}")
+
+    action_space = temp_env.action_space
+    if isinstance(action_space, gym.spaces.Discrete):
+        action_dim  = action_space.n
+        action_type = "discrete"
+        action_high = None
+        action_low  = None
+    elif isinstance(action_space, gym.spaces.Box):
+        action_dim  = action_space.shape[0]
+        action_type = "continuous"
+        action_high = action_space.high.tolist()
+        action_low  = action_space.low.tolist()
+    else:
+        raise ValueError(f"Unsupported action space: {type(action_space).__name__}")
+
+    temp_env.close()
+
+    print(f"\n🔍 Auto-detected environment: {args.env_name}")
+    print(f"   Observation space: {obs_space}")
+    print(f"   Action type:       {action_type}({action_dim})")
+
     config = Config(
+        env_name=args.env_name,
+        state_dim=state_dim,
+        action_dim=action_dim,
+        action_type=action_type,
+        action_high=action_high,
+        action_low=action_low,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         critic_hidden=args.critic_hidden,
@@ -500,6 +550,7 @@ def main() -> None:
         seed=args.seed,
         device_str=args.device,
         log_dir=args.log_dir,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
     train_classical(config)

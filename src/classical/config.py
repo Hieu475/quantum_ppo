@@ -19,6 +19,9 @@ class Config:
     env_name: str = "CartPole-v1"
     state_dim: int = 4          # CartPole observation space
     action_dim: int = 2         # CartPole action space (left / right)
+    action_type: str = "discrete"   # "discrete" or "continuous"
+    action_high: object = None  # Upper bounds for continuous action space
+    action_low: object = None   # Lower bounds for continuous action space
 
     # ── Classical Actor ──────────────────────────────────────────────────
     actor_lr: float = 5e-3      # Learning rate for actor

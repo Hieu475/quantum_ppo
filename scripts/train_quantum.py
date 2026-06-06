@@ -136,6 +136,10 @@ def parse_args() -> argparse.Namespace:
         "--log_dir", type=str, default="runs",
         help="TensorBoard log directory.",
     )
+    parser.add_argument(
+        "--checkpoint_dir", type=str, default="checkpoints",
+        help="Directory to save model checkpoints.",
+    )
 
     return parser.parse_args()
 
@@ -214,6 +218,7 @@ def main() -> None:
         seed=args.seed,
         device_str=args.device,
         log_dir=args.log_dir,
+        checkpoint_dir=args.checkpoint_dir,
     )
 
     # ── Launch training ─────────────────────────────────────────────────
