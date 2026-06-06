@@ -9,16 +9,20 @@ encoding strategies:
   2. Amplitude Embedding: Encode 2^q features into q qubits via amplitudes
   3. Data Re-uploading: Interleave encoding with variational layers at each depth
 
-The classical Pre-encoding NN (state_encoder.py) automatically compresses
-any observation space (vector or image) into the required feature dimension,
-then normalizes to [-π, π] for quantum gate compatibility.
+Architecture (với HPC env, obs_dim=21, n_qubits=6 hoặc 8):
 
-Architecture:
-    Observation → PreEncodingNN(obs → target_dim, Tanh×π) → Quantum Circuit → 
-    PauliZ measurements → Linear(q → action_dim) → Softmax → π(a|s)
+    obs (21)  ──►  Classical Compression Head  ──►  Quantum Circuit  ──►  post_nn
+                   nn.Linear(obs_dim, n_qubits)       VQC (PennyLane)    Linear(n_qubits, action_dim)
+                   nn.LayerNorm(n_qubits)              PauliZ ⟨Z_i⟩
+                   Tanh × π  → [-π, π]
+
+Lớp `classical_compression` là lớp đầu tiên, tường minh bên trong QuantumActor:
+  - nn.Linear(obs_dim, n_qubits)  : nén 21 features xuống 6 hoặc 8 góc xoay
+  - nn.LayerNorm(n_qubits)        : ổn định phân phối trước khi vào cổng lượng tử
+  - Tanh × π                      : đưa output về [-π, π] tương thích RX/RY/RZ
 
 Key design choices:
-  - PreEncodingNN decouples n_qubits from state_dim, enabling any environment
+  - classical_compression decouples obs_dim khỏi n_qubits một cách tường minh
   - Data re-uploading provides non-linearity analogous to activation functions
   - Trainable input scaling adjusts "frequency" of features per layer
   - Rotation gate choice (RX/RY/RZ) is configurable for angle encoding
@@ -66,13 +70,54 @@ class QuantumActor(nn.Module):
         self.encoding_type = config.encoding_type
         self.rotation_gate = config.rotation_gate
 
-        # ── Classical Pre-encoding NN ────────────────────────────────────
-        # Compresses any observation into target_dim features in [-π, π]
-        self.pre_encoding_nn = PreEncodingNN(
-            obs_space=obs_space,
-            n_qubits=config.n_qubits,
-            encoding_type=config.encoding_type,
-            hidden_dim=config.pre_encoding_hidden,
+        # ── Lấy obs_dim từ observation space ────────────────────────────
+        if isinstance(obs_space, gym.spaces.Box):
+            obs_dim = int(np.prod(obs_space.shape))
+        elif isinstance(obs_space, gym.spaces.Discrete):
+            obs_dim = int(obs_space.n)
+        else:
+            raise ValueError(f"Unsupported obs_space type: {type(obs_space)}")
+        self.obs_dim = obs_dim
+
+        # ── Classical Compression Head (Lớp đầu tiên, tường minh) ───────
+        # Pipeline: Linear(obs_dim → n_qubits) → LayerNorm → Tanh × π
+        #
+        # Ví dụ với HPC env:
+        #   obs_dim = 21  (4 nodes × 3 + 3 jobs × 3)
+        #   n_qubits = 6  → nn.Linear(21, 6)
+        #   n_qubits = 8  → nn.Linear(21, 8)
+        #
+        # Tanh × π đảm bảo output ∈ [-π, π] tương thích cổng RX/RY/RZ.
+        # LayerNorm ổn định phân phối đặc trưng trước mạch lượng tử,
+        # giúp tránh vùng bão hòa của Tanh và giảm nguy cơ Barren Plateau.
+        compression_hidden = getattr(config, "compression_hidden", None)
+        if compression_hidden is not None and obs_dim != self.n_qubits:
+            # 2-layer MLP: obs_dim → hidden → n_qubits (khi obs rất lớn)
+            self.classical_compression = nn.Sequential(
+                nn.Linear(obs_dim, compression_hidden),
+                nn.ReLU(),
+                nn.Linear(compression_hidden, self.n_qubits),
+                nn.LayerNorm(self.n_qubits),
+            )
+        elif obs_dim != self.n_qubits:
+            # 1-layer: obs_dim → n_qubits  (trường hợp mặc định)
+            self.classical_compression = nn.Sequential(
+                nn.Linear(obs_dim, self.n_qubits),
+                nn.LayerNorm(self.n_qubits),
+            )
+        else:
+            # obs_dim == n_qubits: không cần nén, dùng Identity
+            self.classical_compression = nn.Identity()
+
+        # Khởi tạo trọng số cho lớp Linear trong compression head
+        for m in self.classical_compression.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=math.sqrt(2))
+                nn.init.zeros_(m.bias)
+
+        print(
+            f"[QuantumActor] Classical compression: "
+            f"Linear({obs_dim} → {self.n_qubits}) + LayerNorm + Tanh×π"
         )
 
         # ── PennyLane quantum device (simulator) ────────────────────────
@@ -302,52 +347,59 @@ class QuantumActor(nn.Module):
         """
         Forward pass: raw observation → action logits.
 
-        Pipeline: state → PreEncodingNN(compress + Tanh×π) → Quantum Circuit → output_map
+        Pipeline:
+            state (obs_dim)
+              → classical_compression  [Linear(obs_dim, n_qubits) + LayerNorm]
+              → Tanh × π               [đưa về [-π, π]]
+              → Quantum Circuit        [VQC với n_qubits]
+              → PauliZ measurements    [(n_qubits,) hoặc (batch, n_qubits)]
+              → post_nn                [Linear(n_qubits, action_dim)]
+              → action logits / means
 
         Args:
-            state: Input state tensor, shape (state_dim,) or (batch, state_dim).
-                   For images: (H, W, C) or (batch, H, W, C).
+            state: Input state tensor, shape (obs_dim,) or (batch, obs_dim).
 
         Returns:
-            Discrete: Action logits, shape (action_dim,) or (batch, action_dim).
+            Discrete:   Action logits, shape (action_dim,) or (batch, action_dim).
             Continuous: Action means (scaled), shape (action_dim,) or (batch, action_dim).
         """
-        # ── Classical pre-encoding: compress + normalize to [-π, π] ─────
-        encoded = self.pre_encoding_nn(state)
+        # ── Bước 1: Classical Compression Head ──────────────────────────
+        # Linear(obs_dim → n_qubits) + LayerNorm + Tanh×π
+        # Ví dụ: Linear(21, 6) hoặc Linear(21, 8)
+        if state.dtype != torch.float32:
+            state = state.float()
+        compressed = self.classical_compression(state)   # (..., n_qubits)
+        encoded = torch.tanh(compressed) * math.pi       # ∈ [-π, π]
 
         if encoded.dim() == 1:
-            # Single state: run circuit once
+            # ── Bước 2a: Single-sample forward ──────────────────────────
             measurements = self.qnode(encoded, self.q_params, self.input_scaling)
-            # Stack PennyLane outputs into a single tensor
-            meas_tensor = torch.stack(list(measurements)).float()
-            
+            meas_tensor = torch.stack(list(measurements)).float()  # (n_qubits,)
+
             if self.action_type == "discrete":
-                return self.post_nn(meas_tensor)
+                return self.post_nn(meas_tensor)                   # (action_dim,)
             else:
                 raw_mean = torch.tanh(self.post_nn(meas_tensor))
-                # Scale from [-1, 1] to [action_low, action_high]
-                scale = (self.action_high - self.action_low) / 2.0
+                scale  = (self.action_high - self.action_low) / 2.0
                 offset = (self.action_high + self.action_low) / 2.0
                 return raw_mean * scale + offset
         else:
-            # Batched states: use native PennyLane broadcasting instead of vmap
-            # (vmap crashes during backward pass with adjoint diff_method)
+            # ── Bước 2b: Batched forward ─────────────────────────────────
+            # PennyLane broadcasting: transposed input để mỗi qubit nhận
+            # một vector (batch,) thay vì một scalar.
             if self.encoding_type == "amplitude":
-                # AmplitudeEmbedding natively broadcasts (batch, features)
-                inputs = encoded
+                inputs = encoded                   # (batch, 2^n_qubits)
             else:
-                # angle and data_reuploading expect inputs[qubit] to be (batch,)
-                # so we transpose (batch, n_qubits) -> (n_qubits, batch)
-                inputs = encoded.T
-                
+                inputs = encoded.T                 # (n_qubits, batch)
+
             measurements = self.qnode(inputs, self.q_params, self.input_scaling)
-            batch_tensor = torch.stack(list(measurements), dim=1).float()
-            
+            batch_tensor = torch.stack(list(measurements), dim=1).float()  # (batch, n_qubits)
+
             if self.action_type == "discrete":
-                return self.post_nn(batch_tensor)
+                return self.post_nn(batch_tensor)                           # (batch, action_dim)
             else:
                 raw_mean = torch.tanh(self.post_nn(batch_tensor))
-                scale = (self.action_high - self.action_low) / 2.0
+                scale  = (self.action_high - self.action_low) / 2.0
                 offset = (self.action_high + self.action_low) / 2.0
                 return raw_mean * scale + offset
 

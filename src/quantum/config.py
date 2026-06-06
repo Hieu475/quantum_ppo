@@ -39,6 +39,13 @@ class Config:
     pre_encoding_hidden: int = 64            # Hidden dim of Pre-encoding MLP/CNN head
     rotation_gate: str = "ry"                # Rotation gate for angle encoding: "rx" | "ry" | "rz"
 
+    # ── Classical Compression Head (QuantumActor first layer) ─────────────
+    # Explicit Linear(obs_dim → n_qubits) bottleneck inside QuantumActor.
+    # None  → single Linear layer  : obs_dim → n_qubits  (mặc định)
+    # int   → 2-layer MLP          : obs_dim → hidden → n_qubits
+    # Ví dụ cho HPC env (obs_dim=21, n_qubits=6): Linear(21, 6) + LayerNorm + Tanh×π
+    compression_hidden: Optional[int] = None
+
     # ── Classical Critic ─────────────────────────────────────────────────
     critic_hidden: int = 64     # Hidden layer width
     critic_lr: float = 1e-3     # Standard Adam LR for classical network
