@@ -49,10 +49,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Internal data structures
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Job:
     """A single HPC workload unit waiting in or running on the cluster."""
@@ -98,9 +95,7 @@ class Node:
         self.ram_used: float = 0.0   # in [0, 1]
         self.running_jobs: List[Job] = []
 
-    # ------------------------------------------------------------------
     # Resource checks
-    # ------------------------------------------------------------------
 
     def can_fit(self, job: Job) -> bool:
         """Return True if the node has enough CPU and RAM for the job."""
@@ -115,9 +110,7 @@ class Node:
         self.ram_used = min(1.0, self.ram_used + job.ram_req)
         self.running_jobs.append(job)
 
-    # ------------------------------------------------------------------
     # Time advancement
-    # ------------------------------------------------------------------
 
     def tick(self) -> int:
         """
@@ -139,9 +132,7 @@ class Node:
         self.running_jobs = still_running
         return finished_count
 
-    # ------------------------------------------------------------------
     # Observation features
-    # ------------------------------------------------------------------
 
     @property
     def max_time_remaining(self) -> float:
@@ -162,10 +153,7 @@ class Node:
             f"ram={self.ram_used:.2f}, jobs={len(self.running_jobs)})"
         )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main environment
-# ─────────────────────────────────────────────────────────────────────────────
 
 class HPCSchedulingEnv(gym.Env):
     """
@@ -261,9 +249,7 @@ class HPCSchedulingEnv(gym.Env):
         # Normalisation constant for job durations (used in observations)
         self._max_duration = self.duration_range[1]
 
-    # ──────────────────────────────────────────────────────────────────────
     # Gymnasium API — reset
-    # ──────────────────────────────────────────────────────────────────────
 
     def reset(
         self,
@@ -295,9 +281,7 @@ class HPCSchedulingEnv(gym.Env):
         info = self._get_info()
         return obs, info
 
-    # ──────────────────────────────────────────────────────────────────────
     # Gymnasium API — step
-    # ──────────────────────────────────────────────────────────────────────
 
     def step(
         self, action: int
@@ -373,9 +357,7 @@ class HPCSchedulingEnv(gym.Env):
 
         return obs, float(reward), terminated, truncated, info
 
-    # ──────────────────────────────────────────────────────────────────────
     # Rendering
-    # ──────────────────────────────────────────────────────────────────────
 
     def render(self) -> Optional[str]:
         """Print or return a human-readable cluster status string."""
@@ -405,9 +387,7 @@ class HPCSchedulingEnv(gym.Env):
             return None
         return text  # "ansi" mode
 
-    # ──────────────────────────────────────────────────────────────────────
     # Private helpers
-    # ──────────────────────────────────────────────────────────────────────
 
     def _generate_jobs(self, n: int) -> List[Job]:
         """
@@ -498,9 +478,7 @@ class HPCSchedulingEnv(gym.Env):
             ],
         }
 
-    # ──────────────────────────────────────────────────────────────────────
     # Utility properties (useful for downstream code / config)
-    # ──────────────────────────────────────────────────────────────────────
 
     @property
     def obs_dim(self) -> int:

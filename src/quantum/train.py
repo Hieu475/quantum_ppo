@@ -25,6 +25,7 @@ from config import Config
 from agent import HybridAgent
 from buffer import RolloutBuffer
 from ppo import PPO
+from ppo_qnpg import PPO_QNPG
 from utils import (
     set_seed,
     make_env,
@@ -54,7 +55,15 @@ def train(config: Config) -> None:
     obs_space = env.observation_space
     agent = HybridAgent(config, obs_space)
     buffer = RolloutBuffer(config)
-    ppo = PPO(agent, config)
+
+    # ── Select optimizer: QNPG or standard Adam PPO ──────────────────────
+    qnpg_enabled = getattr(config, "qnpg_enabled", False)
+    if qnpg_enabled:
+        ppo = PPO_QNPG(agent, config)
+        optimizer_label = f"PPO-QNPG [{config.qnpg_qfim_mode}]"
+    else:
+        ppo = PPO(agent, config)
+        optimizer_label = "PPO-Adam"
 
     # ── TensorBoard ─────────────────────────────────────────────────────
     log_path = os.path.join(
@@ -83,6 +92,7 @@ def train(config: Config) -> None:
     print("\n" + "=" * 60)
     print(" Hybrid Quantum PPO Training")
     print("=" * 60)
+    print(f"  Optimizer:       {optimizer_label}")
     print(f"  Environment:     {config.env_name}")
     print(f"  Obs Space:       {obs_space}")
     print(f"  Encoding:        {config.encoding_type}")
@@ -99,6 +109,11 @@ def train(config: Config) -> None:
     print(f"  Total Timesteps: {config.total_timesteps}")
     print(f"  Device:          {config.device}")
     print(f"  Seed:            {config.seed}")
+    if qnpg_enabled:
+        print(f"  QFIM Mode:       {config.qnpg_qfim_mode}")
+        print(f"  QNPG Damping:    {config.qnpg_damping}")
+        print(f"  QNPG Samples:    {config.qnpg_n_samples}")
+        print(f"  Natural Grad:    {config.qnpg_use_natural_grad}")
     print("=" * 60 + "\n")
 
     # Count parameters
@@ -107,14 +122,15 @@ def train(config: Config) -> None:
     quantum_params = agent.actor.q_params.numel()
     if isinstance(agent.actor.input_scaling, nn.Parameter):
         quantum_params += agent.actor.input_scaling.numel()
-    pre_enc_params = sum(p.numel() for p in agent.actor.pre_encoding_nn.parameters())
+    compression_params = sum(p.numel() for p in agent.actor.classical_compression.parameters())
     post_params = sum(p.numel() for p in agent.actor.post_nn.parameters())
     print(f" Actor params:  {actor_params}")
-    print(f"   ├─ Quantum circuit: {quantum_params}")
-    print(f"   ├─ Pre-encoding:   {pre_enc_params}")
-    print(f"   └─ Post-processing: {post_params}")
+    print(f"   ├─ Quantum circuit:   {quantum_params}")
+    print(f"   ├─ Classical compression: {compression_params}")
+    print(f"   └─ Post-processing:   {post_params}")
     print(f" Critic params: {critic_params}")
     print()
+
 
     # ════════════════════════════════════════════════════════════════════
     # MAIN TRAINING LOOP
@@ -231,6 +247,44 @@ def train(config: Config) -> None:
         writer.add_scalar(
             "timing/update_sec", update_time, global_step
         )
+
+        # ── QNPG-specific metrics ───────────────────────────────────────
+        if qnpg_enabled:
+            if "qnpg/euclidean_grad_norm" in metrics:
+                writer.add_scalar(
+                    "qnpg/euclidean_grad_norm",
+                    metrics["qnpg/euclidean_grad_norm"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "qnpg/natural_grad_norm",
+                    metrics["qnpg/natural_grad_norm"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "qnpg/qfim_mean_diag",
+                    metrics["qnpg/qfim_mean_diag"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "qnpg/qfim_condition",
+                    metrics["qnpg/qfim_condition"],
+                    global_step,
+                )
+                writer.add_scalar(
+                    "qnpg/qfim_effective_dim",
+                    metrics["qnpg/qfim_effective_dim"],
+                    global_step,
+                )
+                # Preconditioning ratio: how much does QFIM change gradient direction?
+                euc_norm = metrics["qnpg/euclidean_grad_norm"]
+                nat_norm = metrics["qnpg/natural_grad_norm"]
+                if euc_norm > 1e-10:
+                    writer.add_scalar(
+                        "qnpg/preconditioning_ratio",
+                        nat_norm / euc_norm,
+                        global_step,
+                    )
 
         # ── Policy variance/std ────────────────────────────────────────
         # High variance/std → diverse actions; low variance/std → deterministic

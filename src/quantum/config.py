@@ -10,6 +10,14 @@ Supports generalized state encoding with three quantum encoding strategies:
   - "angle": Angle Embedding (1 feature per qubit)
   - "amplitude": Amplitude Embedding (2^q features encoded in q qubits)
   - "data_reuploading": Data Re-uploading (features re-encoded at each layer)
+
+QNPG Extensions (Hướng 2 — Quantum Natural Policy Gradient):
+  - qnpg_enabled:         Use QFIM-preconditioned gradient for actor update
+  - qnpg_qfim_mode:       Approximation mode: "diagonal" | "block_diag" | "full"
+  - qnpg_damping:         Tikhonov regularization δ for QFIM inversion
+  - qnpg_n_samples:       #states sampled for Monte Carlo QFIM estimation
+  - qnpg_block_size:      Params per block (block_diag mode; default: n_qubits*3)
+  - qnpg_use_natural_grad: Toggle QNPG vs Adam for ablation study
 """
 
 from dataclasses import dataclass, field
@@ -81,6 +89,45 @@ class Config:
     diagnose_barren_plateau: bool = True   # Monitor quantum gradient magnitudes
     diagnose_interval: int = 10            # Run diagnostics every N updates
 
+    # ── QNPG — Quantum Natural Policy Gradient (Hướng 2) ─────────────────
+    # Enable QNPG to replace Adam for quantum actor parameters.
+    # Classical parameters (compression head, post_nn, critic) always use Adam.
+    qnpg_enabled: bool = False             # False → standard Adam PPO (baseline)
+
+    # QFIM approximation mode for QNPG:
+    #   "diagonal"   — O(2d) evals, fastest; good starting point
+    #   "block_diag" — O(d²/B) per block; captures intra-layer correlations
+    #   "full"       — O(d²) full matrix; most accurate, expensive for d>100
+    qnpg_qfim_mode: str = "diagonal"
+
+    # Tikhonov regularization: F_reg = F + δ·I ensures invertibility.
+    # Larger δ → more conservative (approaches Adam); smaller → more aggressive.
+    # Typical range: 1e-4 (aggressive) to 1e-2 (conservative)
+    qnpg_damping: float = 1e-3
+
+    # Number of states sampled per QFIM estimation (Monte Carlo).
+    # More samples → better QFIM estimate but higher cost.
+    # 4–8 samples is sufficient for diagonal mode.
+    qnpg_n_samples: int = 4
+
+    # Block size for block-diagonal QFIM (ignored in diagonal/full mode).
+    # Default matches n_qubits * 3 (one block per VQC layer).
+    qnpg_block_size: int = 9
+
+    # Ablation toggle: set False to use raw Euclidean gradient (= SGD)
+    # with the QNPG optimizer structure but without QFIM preconditioning.
+    qnpg_use_natural_grad: bool = True
+
+    # Safety clamp: cap nat_grad_norm / euc_grad_norm at this ratio.
+    # Prevents QFIM≈0 → F⁻¹g = g/δ blowing up at start of training.
+    # 10.0 means natural gradient can be at most 10× the Euclidean gradient.
+    qnpg_max_precondition_ratio: float = 10.0
+
+    # Warm-up: number of PPO update steps to use plain Adam gradient
+    # before switching to QNPG. Allows policy to stabilize first.
+    # Default: 5 updates (= 5 * rollout_steps env steps).
+    qnpg_warmup_steps: int = 5
+
     @property
     def device(self) -> torch.device:
         """Resolve device string to torch.device."""
@@ -119,6 +166,16 @@ class Config:
                 f"at most {max_features} features, but state_dim={self.state_dim}. "
                 f"Increase n_qubits or use a different encoding."
             )
+
+        # ── QNPG validation ──────────────────────────────────────────────
+        valid_qfim_modes = ("diagonal", "block_diag", "full")
+        assert self.qnpg_qfim_mode in valid_qfim_modes, (
+            f"qnpg_qfim_mode must be one of {valid_qfim_modes}, "
+            f"got '{self.qnpg_qfim_mode}'."
+        )
+        assert self.qnpg_damping > 0, "qnpg_damping must be positive."
+        assert self.qnpg_n_samples >= 1, "qnpg_n_samples must be >= 1."
+        assert self.qnpg_block_size >= 1, "qnpg_block_size must be >= 1."
 
         # ── General validations ──────────────────────────────────────────
         assert self.rollout_steps >= self.mini_batch_size, (
