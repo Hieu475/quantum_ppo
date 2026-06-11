@@ -319,7 +319,7 @@ def train_classical(config: Config) -> None:
             "timing/update_sec", update_time, global_step
         )
 
-        # ── Policy variance ─────────────────────────────────────────────
+        # ── Policy variance / std ────────────────────────────────────────
         with torch.no_grad():
             sample_state = torch.tensor(
                 env.observation_space.sample(),
@@ -327,12 +327,23 @@ def train_classical(config: Config) -> None:
                 device=config.device,
             )
             dist = agent.actor.get_distribution(sample_state)
-            policy_probs = dist.probs
-            writer.add_scalar(
-                "training/policy_variance",
-                policy_probs.var().item(),
-                global_step,
-            )
+            action_type = getattr(config, "action_type", "discrete")
+            if action_type == "continuous":
+                # Independent(Normal): log mean std across action dims
+                policy_std = dist.base_dist.stddev.mean().item()
+                writer.add_scalar(
+                    "training/policy_std",
+                    policy_std,
+                    global_step,
+                )
+            else:
+                # Categorical: log probability variance
+                policy_probs = dist.probs
+                writer.add_scalar(
+                    "training/policy_variance",
+                    policy_probs.var().item(),
+                    global_step,
+                )
 
         # ── Entropy diagnostic (no barren plateau check) ────────────────
         if update_count % config.diagnose_interval == 0:

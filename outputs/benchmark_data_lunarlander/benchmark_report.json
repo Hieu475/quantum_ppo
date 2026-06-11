@@ -1,0 +1,33 @@
+{
+  "quantum": {
+    "total_episodes": 316,
+    "total_steps": 149092,
+    "best_reward": 175.4116973876953,
+    "final_mean_100": 43.2925399017334,
+    "final_std_100": 121.74932445415521,
+    "final_var_100": 14822.898005043156,
+    "stable_solve_step": null,
+    "first_perfect_step": null,
+    "first_perfect_episode": null,
+    "perfect_episode_count": 0,
+    "avg_update_time_sec": 69.9631342114629,
+    "avg_rollout_time_sec": 8.658512505325112,
+    "avg_fps": 236.53023527314306
+  },
+  "classical": {
+    "total_episodes": 709,
+    "total_steps": 299632,
+    "best_reward": 279.0906066894531,
+    "final_mean_100": 162.5467407667637,
+    "final_std_100": 94.24985145273229,
+    "final_var_100": 8883.034498862102,
+    "stable_solve_step": null,
+    "first_perfect_step": null,
+    "first_perfect_episode": null,
+    "perfect_episode_count": 0,
+    "avg_update_time_sec": 0.9331346547522512,
+    "avg_rollout_time_sec": 1.1196026883157744,
+    "avg_fps": 1829.2203309022236
+  },
+  "comparison": {}
+}
