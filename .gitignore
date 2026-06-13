@@ -39,3 +39,9 @@ Thumbs.db
 
 # Logs
 *.log
+scripts/plot_architecture.py
+scripts/plot_benchmark_charts.py 
+
+docs/analysis/
+
+/outputs/figures/
